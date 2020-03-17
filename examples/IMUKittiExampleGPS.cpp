@@ -31,6 +31,10 @@
 #include <fstream>
 #include <iostream>
 
+#include <gtsam/nonlinear/ExpressionFactorGraph.h>
+#include <gtsam/nonlinear/expressions.h>
+#include <gtsam/slam/expressions.h>
+
 using namespace gtsam;
 using namespace std;
 
@@ -98,8 +102,8 @@ int main(int argc, char* argv[])
             imuMeasurement_t measurement;
             measurement.Time = time;
             measurement.dt = dt;
-            measurement.Accelerometer = Vector3(acc_x, acc_y, acc_z);
-            measurement.Gyroscope = Vector3(gyro_x, gyro_y, gyro_z);
+            measurement.Accelerometer = Rot3::Rx(0.05) * Rot3::Ry(-0.02) * Vector3(acc_x, acc_y, acc_z);
+            measurement.Gyroscope = Rot3::Rx(0.05) * Rot3::Ry(-0.02) * Vector3(gyro_x, gyro_y, gyro_z);
             IMU_measurements.push_back(measurement);
         }
     }
@@ -130,21 +134,22 @@ int main(int argc, char* argv[])
     // Configure different variables
     double tOffset = GPS_measurements[0].Time;
     size_t firstGPSPose = 1;
-    size_t GPSskip = 10; // Skip this many GPS measurements each time
+    size_t GPSskip = 1; // Skip this many GPS measurements each time
     double g = 9.8;
     auto w_coriolis = Vector3(); // zero vector
 
     // Configure noise models
     noiseModel::Diagonal::shared_ptr noiseModelGPS = noiseModel::Diagonal::Precisions((Vector(6) << Vector3::Constant(0), Vector3::Constant(1.0/0.07)).finished());
+    noiseModel::Diagonal::shared_ptr measured_gps_cov = noiseModel::Diagonal::Precisions(Vector3::Constant(1.0/0.07));
 
     // Set initial conditions for the estimated trajectory
     auto currentPoseGlobal = Pose3(Rot3(), GPS_measurements[firstGPSPose].Position); // initial pose is the reference frame (navigation frame)
     auto currentVelocityGlobal = Vector3(); // the vehicle is stationary at the beginning at position 0,0,0
     auto currentBias = imuBias::ConstantBias(); // init with zero bias
 
-    noiseModel::Diagonal::shared_ptr sigma_init_x = noiseModel::Isotropic::Precisions((Vector(6) << Vector3::Constant(0), Vector3::Constant(1.0)).finished());
+    noiseModel::Diagonal::shared_ptr sigma_init_x = noiseModel::Diagonal::Precisions((Vector(6) << Vector3::Constant(0), Vector3::Constant(1.0)).finished());
     noiseModel::Diagonal::shared_ptr sigma_init_v = noiseModel::Isotropic::Sigma(3, 1000.0);
-    noiseModel::Diagonal::shared_ptr sigma_init_b = noiseModel::Isotropic::Sigmas((Vector(6) << Vector3::Constant(0.100), Vector3::Constant(5.00e-05)).finished());
+    noiseModel::Diagonal::shared_ptr sigma_init_b = noiseModel::Diagonal::Sigmas((Vector(6) << Vector3::Constant(0.100), Vector3::Constant(5.00e-05)).finished());
 
     // Set IMU preintegration parameters
     Matrix33 measured_acc_cov = Matrix33::Identity(3,3) * pow(AccelerometerSigma,2);
@@ -167,8 +172,13 @@ int main(int argc, char* argv[])
     ISAM2 isam(isamParams);
 
     // Create the factor graph and values object that will store new factors and values to add to the incremental graph
-    NonlinearFactorGraph newFactors;
+    //NonlinearFactorGraph newFactors;
+    ExpressionFactorGraph newFactors;
     Values newValues; // values storing the initial estimates of new nodes in the factor graph
+
+    auto calibrationPose = Pose3(); // identity transform initially
+    auto calibrationPoseKey = Symbol('c', 1);
+    noiseModel::Diagonal::shared_ptr calibration_sigma_init = noiseModel::Diagonal::Sigmas((Vector(6) << Vector3::Constant(1.0), Vector3::Constant(0.5)).finished());
 
     /// Main loop:
     /// (1) we read the measurements
@@ -191,6 +201,9 @@ int main(int argc, char* argv[])
             newFactors.add(PriorFactor<Pose3>(currentPoseKey, currentPoseGlobal, sigma_init_x));
             newFactors.add(PriorFactor<Vector3>(currentVelKey, currentVelocityGlobal, sigma_init_v));
             newFactors.add(PriorFactor<imuBias::ConstantBias>(currentBiasKey, currentBias, sigma_init_b));
+
+            newValues.insert(calibrationPoseKey, calibrationPose);
+            newFactors.add(PriorFactor<Pose3>(calibrationPoseKey, calibrationPose, calibration_sigma_init));
         } else {
             double t_previous = GPS_measurements[gpsMeasurementIndex-1].Time;
 
@@ -222,15 +235,21 @@ int main(int argc, char* argv[])
             // Create GPS factor
             auto GPSPose = Pose3(currentPoseGlobal.rotation(), GPS_measurements[gpsMeasurementIndex].Position);
             if ((gpsMeasurementIndex % GPSskip) == 0) {
-                newFactors.add(PriorFactor<Pose3>(currentPoseKey, GPSPose, noiseModelGPS));
-                newValues.insert(currentPoseKey, GPSPose);
+                auto global_T_imu = Expression<Pose3>(currentPoseKey);
+                auto imu_T_baselink = Expression<Pose3>(calibrationPoseKey);
+
+                auto global_P_baselink_measurement = GPSPose.translation();
+
+                auto global_T_baselink = global_T_imu * imu_T_baselink;
+                auto global_P_baselink = Expression<Point3>([](const Pose3 &pose, OptionalJacobian<3, 6> H) { return pose.translation(H); }, global_T_baselink);
+
+                newFactors.addExpressionFactor(global_P_baselink, global_P_baselink_measurement, measured_gps_cov);
 
                 printf("################ POSE INCLUDED AT TIME %lf ################\n", t);
-                GPSPose.translation().print();
+                global_P_baselink_measurement.print();
                 printf("\n\n");
-            } else {
-                newValues.insert(currentPoseKey, currentPoseGlobal);
             }
+            newValues.insert(currentPoseKey, currentPoseGlobal);
 
             // Add initial values for velocity and bias based on the previous estimates
             newValues.insert(currentVelKey, currentVelocityGlobal);
@@ -240,7 +259,7 @@ int main(int argc, char* argv[])
             // =======================================================================
             // We accumulate 2*GPSskip GPS measurements before updating the solver at
             //first so that the heading becomes observable.
-            if (gpsMeasurementIndex > (firstGPSPose + 2*GPSskip)) {
+            if (gpsMeasurementIndex > (firstGPSPose + 10*GPSskip)) {
                 printf("################ NEW FACTORS AT TIME %lf ################\n", t);
                 newFactors.print();
 
@@ -256,9 +275,14 @@ int main(int argc, char* argv[])
                 currentPoseGlobal = result.at<Pose3>(currentPoseKey);
                 currentVelocityGlobal = result.at<Vector3>(currentVelKey);
                 currentBias = result.at<imuBias::ConstantBias>(currentBiasKey);
+                calibrationPose = result.at<Pose3>(calibrationPoseKey);
 
                 printf("\n################ POSE AT TIME %lf ################\n", t);
                 currentPoseGlobal.print();
+                printf("\n\n");
+
+                printf("\n################ CALIBRATION AT TIME %lf ################\n", t);
+                calibrationPose.print();
                 printf("\n\n");
             }
         }
